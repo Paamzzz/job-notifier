@@ -1,11 +1,18 @@
+import os # conversa com o sistema operacional
+from dotenv import load_dotenv
 import requests 
+import google.generativeai as genai
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/1556088710293098558/hnKhvZ1iZSqU1pyeLyHXswRn2jkhbk-hlnsjzJlu1QAzdqKznVOBfECkny_DlXI1ZJAI"
+load_dotenv() # carrega variáveis do .env
+
+CHAVE_API = os.getenv("GOOGLE_KEY") # puxa o nome do .env
+genai.configure(api_key=CHAVE_API) # adiciona a chave na genai
+modelo = genai.GenerativeModel('gemini-1.5-flash')
 
 perfis_busca = [
      {
           "nome": "Pamela - Tech",
-          "webhook_url": "https://discord.com/api/webhooks/1556088437680119918/FVZb_6IKK44xtbyFUwfjQfdf-ArD-Xx2jEsnpJq7oIAAq8YgJhFQnXgfwGFUcgwY83F7",
+          "webhook_url": "WEHBOOK_DEV",
           "prompt_filtro": """
                      Você é um recrutador sênior. Avalie a vaga abaixo para o meu perfil.
 
@@ -40,7 +47,7 @@ perfis_busca = [
      },
      {
           "nome": "Nycollas - Edificações",
-          "webhook_url": "https://discord.com/api/webhooks/1556088710293098558/hnKhvZ1iZSqU1pyeLyHXswRn2jkhbk-hlnsjzJlu1QAzdqKznVOBfECkny_DlXI1ZJAI",
+          "webhook_url": "WEBHOOK_EDIFICACOES",
           "prompt_filtro": """
                      Você é um recrutador sênior. Avalie a vaga abaixo para o meu perfil.
 
@@ -72,19 +79,17 @@ perfis_busca = [
      }
 ]
 
-# if "APROVADA: SIM" in resposta_ia:
+# TESTE
+vaga_teste = """
+Vaga: Estágio em Desenvolvimento de Software
+Local: Rio de Janeiro (Híbrido)
+Bolsa: R$ 2.500,00 + VR e Gympass
+Requisitos: Cursando superior em tecnologia. Conhecimento em Python e integração de APIs.
+"""
 
-payload = { # pacote que vamos enviar para o discord
-     "content": "Meu pau na sua mão",
-     "embeds": [ # cartões organizados 
-          {
-               "title": " kkkk zueira te amo",
-               "description": "Love u",
-               "color": 5814783
-          }
-     ]
-}
+prompt_teste = perfis_busca[0]["prompt_filtro"] # pega o 1º perfil
+prompt_completo = f"{prompt_teste}\n\n--- DADOS DA VAGA ---\n{vaga_teste}" # junta prompt + perfil
 
-resposta = requests.post(WEBHOOK_URL, json=payload) # recebimento
+resultado = modelo.generate_content(prompt_completo)
 
-print(f"Código de resposta do Discord: {resposta.status_code}") # injetar variaveis no texto
+print(resultado.text) # injetar variaveis no texto
