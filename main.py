@@ -1,13 +1,12 @@
 import os # conversa com o sistema operacional
 from dotenv import load_dotenv
 import requests 
-import google.generativeai as genai
+from google import genai
 
 load_dotenv() # carrega variáveis do .env
 
 CHAVE_API = os.getenv("GOOGLE_KEY") # puxa o nome do .env
-genai.configure(api_key=CHAVE_API) # adiciona a chave na genai
-modelo = genai.GenerativeModel('gemini-1.5-flash')
+client = genai.Client(api_key=CHAVE_API) # adiciona a chave na genai
 
 perfis_busca = [
      {
@@ -90,6 +89,9 @@ Requisitos: Cursando superior em tecnologia. Conhecimento em Python e integraç�
 prompt_teste = perfis_busca[0]["prompt_filtro"] # pega o 1º perfil
 prompt_completo = f"{prompt_teste}\n\n--- DADOS DA VAGA ---\n{vaga_teste}" # junta prompt + perfil
 
-resultado = modelo.generate_content(prompt_completo)
+resultado = client.models.generate_content(
+     model='gemini-3.8-flash',
+     contents=prompt_completo
+)
 
 print(resultado.text) # injetar variaveis no texto
