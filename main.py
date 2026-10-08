@@ -79,13 +79,6 @@ perfis_busca = [
      }
 ]
 
-# TESTE
-vaga_teste = """
-Vaga: Estágio em Desenvolvimento de Software
-Local: Rio de Janeiro (Híbrido)
-Bolsa: R$ 2.500,00 + VR e Gympass
-Requisitos: Cursando superior em tecnologia. Conhecimento em Python e integração de APIs.
-"""
 
 prompt_teste = perfis_busca[0]["prompt_filtro"] # pega o 1º perfil
 prompt_completo = f"{prompt_teste}\n\n--- DADOS DA VAGA ---\n{vaga_teste}" # junta prompt + perfil
