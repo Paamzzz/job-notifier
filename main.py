@@ -2,6 +2,7 @@ import os # conversa com o sistema operacional
 from dotenv import load_dotenv
 import requests 
 from google import genai
+from scraper import buscar_vagas 
 
 load_dotenv() # carrega variáveis do .env
 
@@ -89,9 +90,12 @@ Requisitos: Cursando superior em tecnologia. Conhecimento em Python e integraç�
 prompt_teste = perfis_busca[0]["prompt_filtro"] # pega o 1º perfil
 prompt_completo = f"{prompt_teste}\n\n--- DADOS DA VAGA ---\n{vaga_teste}" # junta prompt + perfil
 
-resultado = client.models.generate_content(
-     model='gemini-3.8-flash',
-     contents=prompt_completo
-)
+# resultado = client.models.generate_content( 
+#      model='gemini-3.8-flash',
+#      contents=prompt_completo
+# )
 
-print(resultado.text) # injetar variaveis no texto
+# print(resultado.text) # injetar variaveis no texto
+
+vagas = buscar_vagas()
+print(vagas)
