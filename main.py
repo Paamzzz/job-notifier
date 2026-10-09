@@ -80,8 +80,27 @@ perfis_busca = [
 ]
 
 
-prompt_teste = perfis_busca[0]["prompt_filtro"] # pega o 1º perfil
-prompt_completo = f"{prompt_teste}\n\n--- DADOS DA VAGA ---\n{vaga_teste}" # junta prompt + perfil
+prompt_dev = perfis_busca[0]["prompt_filtro"] # pega o 1º perfil
+#
+# O que deve retornar:
+# Você é um recrutador sênior. Avalie a vaga abaixo para o meu perfil...
+# --- DADOS DA VAGA --- 
+# Titulo: VAGA DE DESENVOLVEDOR DE SOFTWARE
+# Descrição: A empresa X está com vagas abertas como...
+
+# Deve retornar 5 prompts
+
+def envio_vagas_dev():
+     lista_prompt = []
+
+     for vaga in buscar_vagas():
+          prompt_teste = f"{prompt_dev}\n\n --- DADOS DA VAGA ---\n\n Titulo: {vaga['titulo']} \n Descrição:{vaga['descricao']}"
+          lista_prompt.append(prompt_teste)
+
+     return lista_prompt
+
+prompts = envio_vagas_dev()
+print(prompts)
 
 # resultado = client.models.generate_content( 
 #      model='gemini-3.8-flash',
@@ -89,6 +108,3 @@ prompt_completo = f"{prompt_teste}\n\n--- DADOS DA VAGA ---\n{vaga_teste}" # jun
 # )
 
 # print(resultado.text) # injetar variaveis no texto
-
-vagas = buscar_vagas()
-print(vagas)
