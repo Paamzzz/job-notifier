@@ -1,12 +1,16 @@
 import hashlib
 import json
 import re
+import threading
 import unicodedata
+import warnings
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import quote, urljoin
 
 import requests
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
+
+warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 # Tenta usar curl_cffi (impersonate="chrome") para contornar bloqueios Cloudflare
 # (essencial para Indeed, InfoJobs e Catho). Caso não esteja disponível, usa requests padrão.
@@ -17,6 +21,9 @@ try:
 except ImportError:
     cffi_requests = None
     TEM_CURL_CFFI = False
+
+# Semáforo para evitar disparar 10 requisições simultâneas no mesmo milissegundo contra o Cloudflare
+_SEMAFORO_CLOUDFLARE = threading.Semaphore(4)
 
 HEADERS_PADRAO = {
     "User-Agent": (
@@ -33,12 +40,30 @@ HEADERS_PADRAO = {
 
 TIMEOUT_PADRAO = 15
 
+# Mapeamento de cidades para GeoIDs oficiais do LinkedIn (evita cair em vagas dos EUA no GitHub Actions)
+MAPA_GEOID_LINKEDIN = {
+    "curitiba": "103501557",        # Curitiba, Paraná, Brasil
+    "rio de janeiro": "103658898",  # Rio de Janeiro, RJ, Brasil
+    "sao paulo": "104746682",       # São Paulo, SP, Brasil
+    "brasil": "106057199",          # Brasil
+    "remoto": "106057199",          # Brasil
+}
+
+MAPA_UF_CIDADE = {
+    "curitiba": "Curitiba, PR",
+    "rio de janeiro": "Rio de Janeiro, RJ",
+    "sao paulo": "São Paulo, SP",
+}
+
 
 def fazer_get(url: str, params: dict | None = None, headers: dict | None = None, usar_impersonate: bool = True):
     """Realiza requisição HTTP GET usando curl_cffi (impersonate Chrome) ou requests padrão."""
     hdrs = headers or HEADERS_PADRAO
     if usar_impersonate and TEM_CURL_CFFI:
-        return cffi_requests.get(url, params=params, headers=hdrs, impersonate="chrome", timeout=TIMEOUT_PADRAO)
+        with _SEMAFORO_CLOUDFLARE:
+            return cffi_requests.get(
+                url, params=params, headers=hdrs, impersonate="chrome", timeout=TIMEOUT_PADRAO
+            )
     return requests.get(url, params=params, headers=hdrs, timeout=TIMEOUT_PADRAO)
 
 
@@ -115,11 +140,11 @@ def normalizar_vaga(
 
 
 # ==============================================================================
-# 1. GUPY (Portal Oficial Gupy via NextData JSON)
+# 1. GUPY (Portal Oficial Gupy via NextData JSON com Filtro de Cidade e Remoto)
 # ==============================================================================
-def _consultar_gupy_termo(termo: str) -> list[dict]:
+def _consultar_gupy_url(sufixo_busca: str) -> list[dict]:
     """Faz a requisição ao portal Gupy e retorna a lista bruta de vagas do NextData."""
-    url = f"https://portal.gupy.io/job-search/term={quote(termo)}"
+    url = f"https://portal.gupy.io/job-search/{sufixo_busca}"
     resp = fazer_get(url, usar_impersonate=False)
     if resp.status_code != 200:
         return []
@@ -138,21 +163,35 @@ def _consultar_gupy_termo(termo: str) -> list[dict]:
     return initial_jobs.get("data", []) if isinstance(initial_jobs, dict) else []
 
 
-def raspar_gupy(termo: str, local: str = "", limite: int = 8) -> list[dict]:
-    """Busca vagas diretamente no Portal Gupy (portal.gupy.io)."""
+def raspar_gupy(termo: str, local: str = "", limite: int = 6) -> list[dict]:
+    """Busca vagas diretamente no Portal Gupy filtrando pela cidade foco e vagas remotas."""
     vagas = []
+    cidade_limpa = local.strip() if local and local.lower() not in ("brasil", "remoto") else ""
 
     try:
-        dados = _consultar_gupy_termo(termo)
-        # Como a Gupy faz busca exata de substring no título, termos compostos (ex: "Estágio Python")
-        # podem vir vazios; nesse caso, busca pela palavra-chave principal do termo.
-        if not dados and " " in termo.strip():
-            palavras = [p for p in termo.split() if len(p) > 2 and p.lower() not in ("em", "de", "da", "do")]
-            if palavras:
-                palavra_foco = palavras[-1] if palavras[0].lower().startswith(("est", "des", "aux", "ana")) else palavras[0]
-                dados = _consultar_gupy_termo(palavra_foco)
+        sufixo = f"term={quote(termo)}"
+        if cidade_limpa:
+            sufixo += f"&city={quote(cidade_limpa)}"
+        dados = _consultar_gupy_url(sufixo)
 
-        for item in dados:
+        # Se o termo composto não retornou resultados na cidade, tenta a palavra específica da área
+        if not dados and " " in termo.strip():
+            palavras_genericas = {"em", "de", "da", "do", "tecnico", "auxiliar", "analista", "estagio", "junior", "desenvolvedor"}
+            palavras_especificas = [
+                p for p in termo.split() if len(p) > 2 and remover_acentos(p).lower() not in palavras_genericas
+            ]
+            if palavras_especificas:
+                palavra_foco = palavras_especificas[0]
+                sufixo_foco = f"term={quote(palavra_foco)}"
+                if cidade_limpa:
+                    sufixo_foco += f"&city={quote(cidade_limpa)}"
+                dados = _consultar_gupy_url(sufixo_foco)
+
+        # Também busca vagas 100% remotas para o termo
+        dados_remoto = _consultar_gupy_url(f"term={quote(termo)}&workplaceType=remote")
+        dados_combinados = (dados or []) + (dados_remoto or [])
+
+        for item in dados_combinados:
             titulo = item.get("name", "")
             empresa = item.get("careerPageName", "Empresa na Gupy")
             cidade = item.get("city", "")
@@ -170,10 +209,9 @@ def raspar_gupy(termo: str, local: str = "", limite: int = 8) -> list[dict]:
             else:
                 modalidade = ""
 
-            # Filtra por cidade caso a vaga não seja remota e tenha cidade especificada
-            if local and local.lower() not in ("brasil", "remoto", ""):
+            if cidade_limpa:
                 local_vaga_sem_acento = remover_acentos(f"{cidade} {estado}").lower()
-                local_alvo_sem_acento = remover_acentos(local).lower()
+                local_alvo_sem_acento = remover_acentos(cidade_limpa).lower()
                 if not remoto and tipo_trabalho != "remote":
                     if (
                         local_alvo_sem_acento not in local_vaga_sem_acento
@@ -205,7 +243,7 @@ def raspar_gupy(termo: str, local: str = "", limite: int = 8) -> list[dict]:
 
 
 # ==============================================================================
-# 2. LINKEDIN (API Guest de Vagas Pública do LinkedIn)
+# 2. LINKEDIN (API Guest de Vagas Pública com GeoID Oficial Brasileiro)
 # ==============================================================================
 def _buscar_descricao_linkedin(job_id: str) -> str:
     """Busca a descrição completa de uma vaga no LinkedIn usando o endpoint público."""
@@ -232,16 +270,23 @@ def _buscar_descricao_linkedin(job_id: str) -> str:
     return ""
 
 
-def raspar_linkedin(termo: str, local: str = "Brasil", limite: int = 6) -> list[dict]:
-    """Busca vagas recentes no LinkedIn via endpoint Guest Jobs e coleta suas descrições."""
+def raspar_linkedin(
+    termo: str, local: str = "Brasil", limite: int = 6, apenas_remoto: bool = False
+) -> list[dict]:
+    """Busca vagas no LinkedIn usando o GeoID oficial da cidade/país para garantir vagas no Brasil."""
     vagas = []
     url = "https://www.linkedin.com/jobs-guest/jobs/api/seeMoreJobPostings/search"
+
+    chave_local = remover_acentos(local).lower().strip()
+    geo_id = MAPA_GEOID_LINKEDIN.get(chave_local, "106057199")
+
     params = {
         "keywords": termo,
-        "location": local or "Brasil",
-        "f_TPR": "r604800",  # Últimos 7 dias
+        "geoId": geo_id,
         "start": 0,
     }
+    if apenas_remoto:
+        params["f_WT"] = "2"  # Filtro nativo do LinkedIn para vagas 100% Remotas
 
     try:
         resp = fazer_get(url, params=params, usar_impersonate=False)
@@ -267,6 +312,8 @@ def raspar_linkedin(termo: str, local: str = "Brasil", limite: int = 6) -> list[
             titulo = limpar_texto(tag_titulo.get_text())
             empresa = limpar_texto(tag_empresa.get_text()) if tag_empresa else "Empresa no LinkedIn"
             local_vaga = limpar_texto(tag_local.get_text()) if tag_local else local
+            if apenas_remoto and "remoto" not in local_vaga.lower():
+                local_vaga = f"{local_vaga} (Remoto)"
             link = tag_link["href"].split("?")[0]
 
             if not job_id:
@@ -276,7 +323,7 @@ def raspar_linkedin(termo: str, local: str = "Brasil", limite: int = 6) -> list[
 
             descricao = _buscar_descricao_linkedin(job_id)
             if not descricao:
-                descricao = f"Vaga de {titulo} na empresa {empresa} em {local_vaga}."
+                descricao = f"Vaga de {titulo} na empresa {empresa} localizada em {local_vaga}."
 
             vagas.append(
                 normalizar_vaga(
@@ -286,6 +333,7 @@ def raspar_linkedin(termo: str, local: str = "Brasil", limite: int = 6) -> list[
                     fonte="LinkedIn",
                     empresa=empresa,
                     local=local_vaga,
+                    modalidade="100% Remoto" if apenas_remoto else "",
                 )
             )
     except Exception as e:
@@ -295,17 +343,18 @@ def raspar_linkedin(termo: str, local: str = "Brasil", limite: int = 6) -> list[
 
 
 # ==============================================================================
-# 3. INDEED BRASIL (Extração de Dados Estruturados via Chrome Impersonation)
+# 3. INDEED BRASIL (Extração de Dados Estruturados por Relevância + Cidade/UF)
 # ==============================================================================
-def raspar_indeed(termo: str, local: str = "Brasil", limite: int = 8) -> list[dict]:
-    """Busca vagas recentes no Indeed Brasil (br.indeed.com)."""
+def raspar_indeed(termo: str, local: str = "Brasil", limite: int = 6) -> list[dict]:
+    """Busca vagas relevantes no Indeed Brasil (br.indeed.com)."""
     vagas = []
     url = "https://br.indeed.com/jobs"
+    chave_local = remover_acentos(local).lower().strip()
+    local_formatado = MAPA_UF_CIDADE.get(chave_local, "" if chave_local == "brasil" else local)
+
     params = {
         "q": termo,
-        "l": "" if local.lower() == "brasil" else local,
-        "fromage": "7",
-        "sort": "date",
+        "l": local_formatado,
     }
 
     try:
@@ -327,13 +376,12 @@ def raspar_indeed(termo: str, local: str = "Brasil", limite: int = 8) -> list[di
                     jobkey = item.get("jobkey", "")
                     titulo = item.get("title", "")
                     empresa = item.get("company", "Empresa no Indeed")
-                    local_vaga = item.get("formattedLocation", local)
+                    local_vaga = item.get("formattedLocation", local_formatado or local)
                     snippet = item.get("snippet", "")
                     taxonomia = item.get("taxonomyAttributes", [])
                     texto_extra = []
                     for attr in taxonomia:
-                        attrs = attr.get("attributes", [])
-                        for a in attrs:
+                        for a in attr.get("attributes", []):
                             if a.get("label"):
                                 texto_extra.append(a["label"])
 
@@ -367,9 +415,9 @@ def raspar_indeed(termo: str, local: str = "Brasil", limite: int = 8) -> list[di
 
 
 # ==============================================================================
-# 4. INFOJOBS BRASIL (Raspagem Completa de Cards e Salários)
+# 4. INFOJOBS BRASIL (Raspagem Completa de Cards, Localização Correta e Salários)
 # ==============================================================================
-def raspar_infojobs(termo: str, local: str = "", limite: int = 8) -> list[dict]:
+def raspar_infojobs(termo: str, local: str = "", limite: int = 6) -> list[dict]:
     """Busca vagas no InfoJobs Brasil (infojobs.com.br)."""
     vagas = []
     termo_busca = f"{termo} {local}".strip() if local and local.lower() != "brasil" else termo
@@ -382,11 +430,12 @@ def raspar_infojobs(termo: str, local: str = "", limite: int = 8) -> list[dict]:
             sopa = BeautifulSoup(resp.text, "html.parser")
             cards = sopa.select("div.js_rowCard")
 
-            for card in cards[:limite]:
+            for card in cards:
                 tag_titulo = card.select_one("h2.js_vacancyTitle, h2")
                 tag_link = card.select_one("a[href*='/vaga-de-'], a.text-decoration-none[href]")
                 tag_empresa = card.select_one("div.text-body a, div.text-body")
-                tag_local = card.select_one("div.text-medium.small, div.mb-8")
+                # div.mb-8 contém a cidade real (ex: "Curitiba - PR, 0Km de você.")
+                tag_local = card.select_one("div.mb-8")
                 tag_faixa = card.select_one("div.d-inline-flex.flex-wrap")
                 blocos_texto = card.select("div.text-medium")
 
@@ -396,9 +445,25 @@ def raspar_infojobs(termo: str, local: str = "", limite: int = 8) -> list[dict]:
                 titulo = limpar_texto(tag_titulo.get_text())
                 link = urljoin("https://www.infojobs.com.br", tag_link.get("href", ""))
                 empresa = limpar_texto(tag_empresa.get_text()) if tag_empresa else "Empresa no InfoJobs"
-                local_vaga = limpar_texto(tag_local.get_text()).split(",")[0] if tag_local else (local or "Brasil")
+                local_vaga = (
+                    limpar_texto(tag_local.get_text()).split(",")[0].strip()
+                    if tag_local
+                    else (local or "Brasil")
+                )
                 faixa_detalhes = limpar_texto(tag_faixa.get_text()) if tag_faixa else ""
                 desc_vaga = limpar_texto(blocos_texto[-1].get_text()) if blocos_texto else titulo
+
+                # Se tem filtro de cidade, ignora vagas presenciais de outros estados
+                if local and local.lower() not in ("brasil", "remoto", ""):
+                    loc_norm = remover_acentos(local_vaga).lower()
+                    alvo_norm = remover_acentos(local).lower()
+                    detalhes_norm = remover_acentos(faixa_detalhes).lower()
+                    if (
+                        alvo_norm not in loc_norm
+                        and "home office" not in detalhes_norm
+                        and "remoto" not in detalhes_norm
+                    ):
+                        continue
 
                 descricao_final = f"{faixa_detalhes}. {desc_vaga}" if faixa_detalhes else desc_vaga
 
@@ -413,6 +478,8 @@ def raspar_infojobs(termo: str, local: str = "", limite: int = 8) -> list[dict]:
                         salario=faixa_detalhes if "R$" in faixa_detalhes else "Não informado",
                     )
                 )
+                if len(vagas) >= limite:
+                    break
     except Exception as e:
         print(f"  [InfoJobs] Aviso ao buscar '{termo}': {e}")
 
@@ -422,7 +489,7 @@ def raspar_infojobs(termo: str, local: str = "", limite: int = 8) -> list[dict]:
 # ==============================================================================
 # 5. VAGAS.COM.BR (Raspagem Direta HTML)
 # ==============================================================================
-def raspar_vagas_com(termo: str, local: str = "", limite: int = 8) -> list[dict]:
+def raspar_vagas_com(termo: str, local: str = "", limite: int = 5) -> list[dict]:
     """Busca vagas no portal Vagas.com.br."""
     vagas = []
     slug = gerar_slug(termo)
@@ -455,7 +522,6 @@ def raspar_vagas_com(termo: str, local: str = "", limite: int = 8) -> list[dict]
             if nivel:
                 descricao = f"Nível: {nivel}. {descricao}"
 
-            # Se o perfil pediu uma cidade específica, aceita vagas da cidade, remotas ou nacionais
             if local and local.lower() not in ("brasil", "remoto", ""):
                 loc_norm = remover_acentos(local_vaga).lower()
                 alvo_norm = remover_acentos(local).lower()
@@ -496,7 +562,7 @@ MAPA_CIDADES_TRABALHA_BRASIL = {
 }
 
 
-def raspar_trabalha_brasil(termo: str, local: str = "", limite: int = 8) -> list[dict]:
+def raspar_trabalha_brasil(termo: str, local: str = "", limite: int = 6) -> list[dict]:
     """Busca vagas no portal Trabalha Brasil (trabalhabrasil.com.br)."""
     vagas = []
     slug_termo = gerar_slug(termo)
@@ -516,7 +582,7 @@ def raspar_trabalha_brasil(termo: str, local: str = "", limite: int = 8) -> list
         sopa = BeautifulSoup(resp.text, "html.parser")
         cards = sopa.select("a.job-link, a.jobCard, div.jg__job")
 
-        for card in cards[:limite]:
+        for card in cards:
             tag_titulo = card.select_one("h2.job-title, h2.job__name, h2, h3")
             tag_empresa = card.select_one("p.job-company, h3.job__company")
             tag_local = card.select_one("p.job-location, h3.job__detail")
@@ -529,17 +595,21 @@ def raspar_trabalha_brasil(termo: str, local: str = "", limite: int = 8) -> list
             if not tag_titulo or not link_rel:
                 continue
 
+            # Ignora anúncios de PJ caso o regime já informe "Autônomo" ou "PJ"
+            regime = limpar_texto(tag_regime.get_text()) if tag_regime else ""
+            if any(p in regime.lower() for p in ("autônomo", "autonomo", "pj", "prestador")):
+                continue
+
             link = urljoin("https://www.trabalhabrasil.com.br", link_rel)
             titulo = limpar_texto(tag_titulo.get_text())
             empresa = limpar_texto(tag_empresa.get_text()) if tag_empresa else "Empresa no Trabalha Brasil"
             local_vaga = limpar_texto(tag_local.get_text()) if tag_local else (local or "Brasil")
             salario = limpar_texto(tag_salario.get_text()) if tag_salario else "Não informado"
             modalidade = limpar_texto(tag_modalidade.get_text()) if tag_modalidade else ""
-            regime = limpar_texto(tag_regime.get_text()) if tag_regime else ""
             desc_extra = limpar_texto(tag_desc.get_text()) if tag_desc else ""
 
             partes_desc = [
-                f"Vaga: {titulo}",
+                f"Cargo: {titulo}",
                 f"Regime: {regime}" if regime else "",
                 f"Modalidade: {modalidade}" if modalidade else "",
                 f"Remuneração: {salario}" if salario != "Não informado" else "",
@@ -559,6 +629,8 @@ def raspar_trabalha_brasil(termo: str, local: str = "", limite: int = 8) -> list
                     modalidade=modalidade,
                 )
             )
+            if len(vagas) >= limite:
+                break
     except Exception as e:
         print(f"  [Trabalha Brasil] Aviso ao buscar '{termo}': {e}")
 
@@ -568,7 +640,7 @@ def raspar_trabalha_brasil(termo: str, local: str = "", limite: int = 8) -> list
 # ==============================================================================
 # 7. CATHO (Raspagem via JSON NextData / HTML)
 # ==============================================================================
-def raspar_catho(termo: str, local: str = "", limite: int = 8) -> list[dict]:
+def raspar_catho(termo: str, local: str = "", limite: int = 6) -> list[dict]:
     """Busca vagas no portal Catho (catho.com.br)."""
     vagas = []
     slug = gerar_slug(termo)
@@ -737,7 +809,7 @@ def raspar_github_vagas(limite_por_repo: int = 5) -> list[dict]:
 
 
 # ==============================================================================
-# ORQUESTRADOR PRINCIPAL DE RASPAGEM MULTI-FONTES
+# ORQUESTRADOR PRINCIPAL DE RASPAGEM MULTI-FONTES (COM INTERCALAÇÃO POR FONTE)
 # ==============================================================================
 def buscar_vagas(
     termos_busca: list[str] | None = None,
@@ -747,9 +819,9 @@ def buscar_vagas(
 ) -> list[dict]:
     """
     Vasculha simultaneamente múltiplas plataformas de emprego:
-    LinkedIn, Gupy, Indeed, InfoJobs, Vagas.com.br, Catho, Trabalha Brasil,
+    LinkedIn, Gupy, Indeed, InfoJobs, Trabalha Brasil, Catho, Vagas.com.br,
     Programathor e GitHub Vagas BR.
-    Retorna uma lista de vagas únicas e padronizadas.
+    Intercala (Round-Robin) as vagas de cada fonte para garantir máxima diversidade.
     """
     if not termos_busca:
         termos_busca = [
@@ -769,24 +841,24 @@ def buscar_vagas(
     tarefas = []
     vagas_coletadas = []
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
+    with ThreadPoolExecutor(max_workers=8) as executor:
         for termo in termos_busca:
-            # 1. Gupy
-            tarefas.append(executor.submit(raspar_gupy, termo, local_principal, limite_por_fonte))
-            # 2. LinkedIn (Local específico + Remoto Brasil)
-            tarefas.append(executor.submit(raspar_linkedin, termo, local_principal, limite_por_fonte))
+            # 1. LinkedIn (Cidade específica com GeoID oficial + 100% Remoto no Brasil)
+            tarefas.append(executor.submit(raspar_linkedin, termo, local_principal, limite_por_fonte, False))
             if local_principal.lower() not in ("brasil", "remoto"):
-                tarefas.append(executor.submit(raspar_linkedin, f"{termo} remoto", "Brasil", 3))
+                tarefas.append(executor.submit(raspar_linkedin, termo, "Brasil", 3, True))
+            # 2. Gupy (Cidade específica + Remoto)
+            tarefas.append(executor.submit(raspar_gupy, termo, local_principal, limite_por_fonte))
             # 3. Indeed Brasil
             tarefas.append(executor.submit(raspar_indeed, termo, local_principal, limite_por_fonte))
             # 4. InfoJobs Brasil
             tarefas.append(executor.submit(raspar_infojobs, termo, local_principal, limite_por_fonte))
-            # 5. Vagas.com.br
-            tarefas.append(executor.submit(raspar_vagas_com, termo, local_principal, limite_por_fonte))
-            # 6. Trabalha Brasil
+            # 5. Trabalha Brasil
             tarefas.append(executor.submit(raspar_trabalha_brasil, termo, local_principal, limite_por_fonte))
-            # 7. Catho
+            # 6. Catho
             tarefas.append(executor.submit(raspar_catho, termo, local_principal, limite_por_fonte))
+            # 7. Vagas.com.br
+            tarefas.append(executor.submit(raspar_vagas_com, termo, local_principal, limite_por_fonte))
 
             # 8. Fontes exclusivas de Tecnologia (Programathor)
             if incluir_fontes_tech:
@@ -815,14 +887,35 @@ def buscar_vagas(
             vagas_unicas[id_vaga] = vaga
             chaves_titulo_empresa.add(chave_te)
 
-    lista_final = list(vagas_unicas.values())
+    # Agrupa por fonte e intercala (Round-Robin) para que o topo da lista tenha
+    # vagas de todas as fontes (LinkedIn, Indeed, InfoJobs, Gupy, Trabalha Brasil, Catho, Vagas.com.br)
+    por_fonte: dict[str, list[dict]] = {}
+    for vaga in vagas_unicas.values():
+        por_fonte.setdefault(vaga["fonte"], []).append(vaga)
 
-    contagem_fontes = {}
-    for v in lista_final:
-        fonte = v["fonte"]
-        contagem_fontes[fonte] = contagem_fontes.get(fonte, 0) + 1
+    ordem_prioridade_fontes = [
+        "LinkedIn",
+        "Gupy",
+        "Indeed",
+        "InfoJobs",
+        "Trabalha Brasil",
+        "Catho",
+        "Vagas.com.br",
+        "Programathor",
+    ]
+    fontes_ordenadas = [f for f in ordem_prioridade_fontes if f in por_fonte] + [
+        f for f in por_fonte if f not in ordem_prioridade_fontes
+    ]
 
-    resumo_fontes = ", ".join(f"{f}: {qtd}" for f, qtd in sorted(contagem_fontes.items()))
-    print(f"✅ Total de {len(lista_final)} vagas únicas encontradas! ({resumo_fontes or 'Nenhuma'})")
+    lista_intercalada = []
+    max_len = max((len(lst) for lst in por_fonte.values()), default=0)
+    for i in range(max_len):
+        for f in fontes_ordenadas:
+            if i < len(por_fonte[f]):
+                lista_intercalada.append(por_fonte[f][i])
 
-    return lista_final
+    contagem_fontes = {f: len(por_fonte[f]) for f in sorted(por_fonte)}
+    resumo_fontes = ", ".join(f"{f}: {qtd}" for f, qtd in contagem_fontes.items())
+    print(f"✅ Total de {len(lista_intercalada)} vagas únicas encontradas! ({resumo_fontes or 'Nenhuma'})")
+
+    return lista_intercalada
