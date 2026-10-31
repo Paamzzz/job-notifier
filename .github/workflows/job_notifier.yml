@@ -1,8 +1,11 @@
 name: AI Job Scraper & Notifier
 
 on:
+  push:
+    branches:
+      - main # Executa imediatamente assim que você der git push hoje
   schedule:
-    # Executa automaticamente 1 vez por dia às 09:00 da manhã (Horário de Brasília / UTC-3 -> 12:00 UTC)
+    # Nos próximos dias, executa automaticamente 1 vez por dia às 09:00 da manhã (Horário de Brasília / UTC-3 -> 12:00 UTC)
     - cron: "0 12 * * *"
   workflow_dispatch: # Permite rodar manualmente pela aba Actions do GitHub
 

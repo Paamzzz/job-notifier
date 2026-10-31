@@ -23,6 +23,7 @@ client = genai.Client(api_key=CHAVE_API) if CHAVE_API else None
 perfis_busca = [
     {
         "nome": "Nycollas - Edificações",
+        "ativo": True,
         "webhook_url": (os.getenv("WEBHOOK_EDIFICACOES") or "").strip(),
         "incluir_fontes_tech": False,
         "localizacoes": ["Curitiba", "Brasil"],
@@ -80,6 +81,7 @@ perfis_busca = [
     },
     {
         "nome": "Pamela - Tech",
+        "ativo": False,  # Desativado temporariamente (mude para True quando quiser reativar)
         "webhook_url": (os.getenv("WEBHOOK_DEV") or os.getenv("WEHBOOK_DEV") or "").strip(),
         "incluir_fontes_tech": True,
         "localizacoes": ["Rio de Janeiro", "Brasil"],
@@ -461,6 +463,10 @@ def executar_pipeline() -> None:
 
     for perfil in perfis_busca:
         nome_perfil = perfil["nome"]
+        if not perfil.get("ativo", True):
+            print(f"\n⏸️ Perfil '{nome_perfil}' está desativado no momento. Pulando...")
+            continue
+
         print(f"\n📌 Processando perfil: {nome_perfil}")
         print("-" * 70)
 
