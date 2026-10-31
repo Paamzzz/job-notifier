@@ -1,0 +1,40 @@
+name: AI Job Scraper & Notifier
+
+on:
+  schedule:
+    # Executa automaticamente 1 vez por dia às 09:00 da manhã (Horário de Brasília / UTC-3 -> 12:00 UTC)
+    - cron: "0 12 * * *"
+  workflow_dispatch: # Permite rodar manualmente pela aba Actions do GitHub
+
+jobs:
+  scrape-and-notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Restaurar cache do histórico de vagas
+        uses: actions/cache@v4
+        with:
+          path: historico_vagas.json
+          key: historico-vagas-${{ github.run_id }}
+          restore-keys: |
+            historico-vagas-
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt
+
+      - name: Executar raspagem e notificação
+        env:
+          GOOGLE_KEY: ${{ secrets.GOOGLE_KEY }}
+          WEBHOOK_DEV: ${{ secrets.WEBHOOK_DEV }}
+          WEBHOOK_EDIFICACOES: ${{ secrets.WEBHOOK_EDIFICACOES }}
+          LIMITE_VAGAS_POR_PERFIL: "60"
+        run: python main.py
